@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EKS stack handler for the EKS MCP Server."""
+"""EKS stack handler for the EKS MCP Server.
+
+This module provides tools for creating, managing, and deleting CloudFormation
+stacks for EKS clusters, with support for multi-region and multi-account operations.
+"""
 
 import json
 import os
 import yaml
 from awslabs.eks_mcp_server.aws_helper import AwsHelper
+from awslabs.eks_mcp_server.config import ClusterConfig, ConfigManager
 from awslabs.eks_mcp_server.consts import (
     CFN_CAPABILITY_IAM,
     CFN_ON_FAILURE_DELETE,
@@ -37,7 +42,7 @@ from awslabs.eks_mcp_server.models import (
 from mcp.server.fastmcp import Context
 from mcp.types import CallToolResult, TextContent
 from pydantic import Field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 
 class EksStackHandler:
@@ -58,10 +63,34 @@ class EksStackHandler:
         self.allow_write = allow_write
 
         # Register tools
-        self.mcp.tool(name='manage_eks_stacks')(self.manage_eks_stacks)
+        self.mcp.tool(name="manage_eks_stacks")(self.manage_eks_stacks)
+
+    def _get_cfn_client(self, cluster_name: Optional[str] = None):
+        """Get a CloudFormation client with appropriate credentials.
+
+        If a cluster configuration is available for the given cluster name,
+        uses the configured credentials. Otherwise falls back to default.
+
+        Args:
+            cluster_name: Optional cluster name to look up configuration
+
+        Returns:
+            CloudFormation boto3 client
+        """
+        if cluster_name:
+            cluster_config = ConfigManager.get_cluster(cluster_name)
+            if cluster_config:
+                return AwsHelper.create_boto3_client_for_cluster(
+                    cluster_config, "cloudformation"
+                )
+        return AwsHelper.create_boto3_client("cloudformation")
 
     def _ensure_stack_ownership(
-        self, ctx: Context, stack_name: str, operation: str
+        self,
+        ctx: Context,
+        stack_name: str,
+        operation: str,
+        cluster_name: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """Ensure that a stack exists and was created by this tool.
 
@@ -69,6 +98,7 @@ class EksStackHandler:
             ctx: The MCP context
             stack_name: Name of the stack to verify
             operation: Operation being performed (for error messages)
+            cluster_name: Optional cluster name for credential lookup
 
         Returns:
             Tuple of (success, stack_details, error_message)
@@ -77,34 +107,41 @@ class EksStackHandler:
             - error_message: Error message if the stack doesn't exist or wasn't created by this tool, None if successful
         """
         try:
-            # Create CloudFormation client
-            cfn_client = AwsHelper.create_boto3_client('cloudformation')
+            # Create CloudFormation client with appropriate credentials
+            cfn_client = self._get_cfn_client(cluster_name)
 
             # Get stack details
             stack_details = cfn_client.describe_stacks(StackName=stack_name)
-            stack = stack_details['Stacks'][0]
+            stack = stack_details["Stacks"][0]
 
             # Verify the stack was created by our tool
-            tags = stack.get('Tags', [])
+            tags = stack.get("Tags", [])
             is_our_stack = False
             for tag in tags:
-                if tag.get('Key') == CFN_STACK_TAG_KEY and tag.get('Value') == CFN_STACK_TAG_VALUE:
+                if (
+                    tag.get("Key") == CFN_STACK_TAG_KEY
+                    and tag.get("Value") == CFN_STACK_TAG_VALUE
+                ):
                     is_our_stack = True
                     break
 
             if not is_our_stack:
                 error_message = STACK_NOT_OWNED_ERROR_TEMPLATE.format(
-                    stack_name=stack_name, tool_name=CFN_STACK_TAG_VALUE, operation=operation
+                    stack_name=stack_name,
+                    tool_name=CFN_STACK_TAG_VALUE,
+                    operation=operation,
                 )
                 log_with_request_id(ctx, LogLevel.ERROR, error_message)
                 return False, stack, error_message
 
             return True, stack, None
         except Exception as e:
-            if 'does not exist' in str(e):
-                error_message = f'Stack {stack_name} not found or cannot be accessed: {str(e)}'
+            if "does not exist" in str(e):
+                error_message = (
+                    f"Stack {stack_name} not found or cannot be accessed: {str(e)}"
+                )
             else:
-                error_message = f'Error verifying stack ownership: {str(e)}'
+                error_message = f"Error verifying stack ownership: {str(e)}"
 
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
             return False, None, error_message
@@ -180,29 +217,31 @@ class EksStackHandler:
             if not self.allow_write and operation not in [
                 DESCRIBE_OPERATION,
             ]:
-                error_message = f'Operation {operation} is not allowed without write access'
+                error_message = (
+                    f"Operation {operation} is not allowed without write access"
+                )
                 log_with_request_id(ctx, LogLevel.ERROR, error_message)
 
                 # Return error response
                 return CallToolResult(
                     isError=True,
-                    content=[TextContent(type='text', text=error_message)],
+                    content=[TextContent(type="text", text=error_message)],
                 )
 
             if operation == GENERATE_OPERATION:
                 if template_file is None:
-                    raise ValueError('template_file is required for generate operation')
+                    raise ValueError("template_file is required for generate operation")
                 if cluster_name is None:
-                    raise ValueError('cluster_name is required for generate operation')
+                    raise ValueError("cluster_name is required for generate operation")
                 return await self._generate_template(
                     ctx=ctx, template_path=template_file, cluster_name=cluster_name
                 )
 
             elif operation == DEPLOY_OPERATION:
                 if template_file is None:
-                    raise ValueError('template_file is required for deploy operation')
+                    raise ValueError("template_file is required for deploy operation")
                 if cluster_name is None:
-                    raise ValueError('cluster_name is required for deploy operation')
+                    raise ValueError("cluster_name is required for deploy operation")
 
                 # Derive stack name from cluster name
                 stack_name = CFN_STACK_NAME_TEMPLATE.format(cluster_name=cluster_name)
@@ -215,7 +254,7 @@ class EksStackHandler:
 
             elif operation == DESCRIBE_OPERATION:
                 if cluster_name is None:
-                    raise ValueError('cluster_name is required for describe operation')
+                    raise ValueError("cluster_name is required for describe operation")
 
                 # Derive stack name from cluster name
                 stack_name = CFN_STACK_NAME_TEMPLATE.format(cluster_name=cluster_name)
@@ -225,7 +264,7 @@ class EksStackHandler:
 
             elif operation == DELETE_OPERATION:
                 if cluster_name is None:
-                    raise ValueError('cluster_name is required for delete operation')
+                    raise ValueError("cluster_name is required for delete operation")
 
                 # Derive stack name from cluster name
                 stack_name = CFN_STACK_NAME_TEMPLATE.format(cluster_name=cluster_name)
@@ -234,22 +273,24 @@ class EksStackHandler:
                 )
 
             else:
-                error_message = f'Invalid operation: {operation}. Must be one of: generate, deploy, describe, delete'
+                error_message = f"Invalid operation: {operation}. Must be one of: generate, deploy, describe, delete"
                 log_with_request_id(ctx, LogLevel.ERROR, error_message)
                 return CallToolResult(
                     isError=True,
-                    content=[TextContent(type='text', text=error_message)],
+                    content=[TextContent(type="text", text=error_message)],
                 )
         except ValueError as e:
             # Re-raise ValueError for parameter validation errors
-            log_with_request_id(ctx, LogLevel.ERROR, f'Parameter validation error: {str(e)}')
+            log_with_request_id(
+                ctx, LogLevel.ERROR, f"Parameter validation error: {str(e)}"
+            )
             raise
         except Exception as e:
-            error_message = f'Error in manage_eks_stacks: {str(e)}'
+            error_message = f"Error in manage_eks_stacks: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message)],
+                content=[TextContent(type="text", text=error_message)],
             )
 
     async def _generate_template(
@@ -271,14 +312,17 @@ class EksStackHandler:
         try:
             # Get the source template path
             source_template_path = os.path.join(
-                os.path.dirname(__file__), 'templates', 'eks-templates', 'eks-with-vpc.yaml'
+                os.path.dirname(__file__),
+                "templates",
+                "eks-templates",
+                "eks-with-vpc.yaml",
             )
 
             # Create directory if it doesn't exist
             os.makedirs(os.path.dirname(template_path), exist_ok=True)
 
             # Read the template
-            with open(source_template_path, 'r') as source_file:
+            with open(source_template_path, "r") as source_file:
                 template_content = source_file.read()
 
             # Parse the template as YAML
@@ -286,57 +330,65 @@ class EksStackHandler:
 
             # Modify the template to set the cluster name directly
             # Find the ClusterName parameter and set its default value
-            if 'Parameters' in template_yaml and 'ClusterName' in template_yaml['Parameters']:
-                template_yaml['Parameters']['ClusterName']['Default'] = cluster_name
+            if (
+                "Parameters" in template_yaml
+                and "ClusterName" in template_yaml["Parameters"]
+            ):
+                template_yaml["Parameters"]["ClusterName"]["Default"] = cluster_name
 
             # Remove checkov metadata from the EKS cluster resource
-            if 'Resources' in template_yaml and 'EksCluster' in template_yaml['Resources']:
-                self._remove_checkov_metadata(template_yaml['Resources']['EksCluster'])
+            if (
+                "Resources" in template_yaml
+                and "EksCluster" in template_yaml["Resources"]
+            ):
+                self._remove_checkov_metadata(template_yaml["Resources"]["EksCluster"])
 
             # Convert back to YAML
             modified_template = yaml.dump(template_yaml, default_flow_style=False)
 
             # Write the modified template to the destination
-            with open(template_path, 'w') as dest_file:
+            with open(template_path, "w") as dest_file:
                 dest_file.write(modified_template)
 
             log_with_request_id(
                 ctx,
                 LogLevel.INFO,
-                f'Generated CloudFormation template at {template_path} with cluster name {cluster_name}',
+                f"Generated CloudFormation template at {template_path} with cluster name {cluster_name}",
             )
 
             data = ManageEksStacksData(
                 operation=GENERATE_OPERATION,
                 template_path=template_path,
                 cluster_name=cluster_name,
-                stack_name='',
-                stack_id='',
-                stack_arn='',
-                creation_time='',
-                stack_status='',
+                stack_name="",
+                stack_id="",
+                stack_arn="",
+                creation_time="",
+                stack_status="",
             )
 
             return CallToolResult(
                 isError=False,
                 content=[
                     TextContent(
-                        type='text',
-                        text=f'CloudFormation template generated at {template_path} with cluster name {cluster_name}',
+                        type="text",
+                        text=f"CloudFormation template generated at {template_path} with cluster name {cluster_name}",
                     ),
                     TextContent(
-                        type='text',
+                        type="text",
                         text=json.dumps(data.model_dump()),
                     ),
                 ],
             )
         except Exception as e:
-            error_message = f'Failed to generate template: {str(e)}'
+            error_message = f"Failed to generate template: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
 
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message or 'Unknown error')],
+                content=[
+                    TextContent(type="text", text=error_message or "Unknown error")
+                ],
             )
 
     async def _deploy_stack(
@@ -344,18 +396,15 @@ class EksStackHandler:
     ) -> CallToolResult:
         """Deploy a CloudFormation stack from the specified template file."""
         try:
-            # Create CloudFormation client
-            cfn_client = AwsHelper.create_boto3_client('cloudformation')
-
             # Read the template
-            with open(template_file, 'r') as template_file_obj:
+            with open(template_file, "r") as template_file_obj:
                 template_body = template_file_obj.read()
 
             # Check if the stack already exists and verify ownership
             stack_exists = False
             try:
                 success, stack, error_message = self._ensure_stack_ownership(
-                    ctx, stack_name, 'update'
+                    ctx, stack_name, "update", cluster_name
                 )
                 if stack:
                     stack_exists = True
@@ -363,34 +412,39 @@ class EksStackHandler:
                         return CallToolResult(
                             isError=True,
                             content=[
-                                TextContent(type='text', text=error_message or 'Unknown error')
+                                TextContent(
+                                    type="text", text=error_message or "Unknown error"
+                                )
                             ],
                         )
             except Exception:
                 # Stack doesn't exist, we'll create it
                 stack_exists = False
 
+            # Get CloudFormation client with appropriate credentials
+            cfn_client = self._get_cfn_client(cluster_name)
+
             # Create or update the stack
             if stack_exists:
                 log_with_request_id(
                     ctx,
                     LogLevel.INFO,
-                    f'Updating CloudFormation stack {stack_name} for EKS cluster {cluster_name}',
+                    f"Updating CloudFormation stack {stack_name} for EKS cluster {cluster_name}",
                 )
 
                 response = cfn_client.update_stack(
                     StackName=stack_name,
                     TemplateBody=template_body,
                     Capabilities=[CFN_CAPABILITY_IAM],
-                    Tags=[{'Key': CFN_STACK_TAG_KEY, 'Value': CFN_STACK_TAG_VALUE}],
+                    Tags=[{"Key": CFN_STACK_TAG_KEY, "Value": CFN_STACK_TAG_VALUE}],
                 )
 
-                operation_text = 'update'
+                operation_text = "update"
             else:
                 log_with_request_id(
                     ctx,
                     LogLevel.INFO,
-                    f'Creating CloudFormation stack {stack_name} for EKS cluster {cluster_name}',
+                    f"Creating CloudFormation stack {stack_name} for EKS cluster {cluster_name}",
                 )
 
                 response = cfn_client.create_stack(
@@ -398,10 +452,10 @@ class EksStackHandler:
                     TemplateBody=template_body,
                     Capabilities=[CFN_CAPABILITY_IAM],
                     OnFailure=CFN_ON_FAILURE_DELETE,
-                    Tags=[{'Key': CFN_STACK_TAG_KEY, 'Value': CFN_STACK_TAG_VALUE}],
+                    Tags=[{"Key": CFN_STACK_TAG_KEY, "Value": CFN_STACK_TAG_VALUE}],
                 )
 
-                operation_text = 'creation'
+                operation_text = "creation"
 
             log_with_request_id(
                 ctx,
@@ -412,34 +466,36 @@ class EksStackHandler:
             data = ManageEksStacksData(
                 operation=DEPLOY_OPERATION,
                 stack_name=stack_name,
-                stack_arn=response['StackId'],
-                stack_id=response['StackId'],
+                stack_arn=response["StackId"],
+                stack_id=response["StackId"],
                 cluster_name=cluster_name,
-                template_path='',
-                creation_time='',
-                stack_status='',
+                template_path="",
+                creation_time="",
+                stack_status="",
             )
 
             return CallToolResult(
                 isError=False,
                 content=[
                     TextContent(
-                        type='text',
-                        text=f'CloudFormation stack {operation_text} initiated. Stack {operation_text} is in progress and typically takes 15-20 minutes to complete.',
+                        type="text",
+                        text=f"CloudFormation stack {operation_text} initiated. Stack {operation_text} is in progress and typically takes 15-20 minutes to complete.",
                     ),
                     TextContent(
-                        type='text',
+                        type="text",
                         text=json.dumps(data.model_dump()),
                     ),
                 ],
             )
         except Exception as e:
-            error_message = f'Failed to deploy stack: {str(e)}'
+            error_message = f"Failed to deploy stack: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
 
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message or 'Unknown error')],
+                content=[
+                    TextContent(type="text", text=error_message or "Unknown error")
+                ],
             )
 
     async def _describe_stack(
@@ -449,54 +505,56 @@ class EksStackHandler:
         try:
             # Verify stack ownership
             success, stack, error_message = self._ensure_stack_ownership(
-                ctx, stack_name, 'describe'
+                ctx, stack_name, "describe", cluster_name
             )
             if not success:
                 # Prepare error response with available stack details
-                stack_id = ''
-                creation_time = ''
-                stack_status = ''
+                stack_id = ""
+                creation_time = ""
+                stack_status = ""
 
                 if stack:
-                    stack_id = stack['StackId']
-                    creation_time = stack['CreationTime'].isoformat()
-                    stack_status = stack['StackStatus']
+                    stack_id = stack["StackId"]
+                    creation_time = stack["CreationTime"].isoformat()
+                    stack_status = stack["StackStatus"]
 
                 return CallToolResult(
                     isError=True,
-                    content=[TextContent(type='text', text=error_message or 'Unknown error')],
+                    content=[
+                        TextContent(type="text", text=error_message or "Unknown error")
+                    ],
                 )
 
             # Extract outputs
             outputs = {}
-            if stack and 'Outputs' in stack:
-                for output in stack['Outputs']:
-                    if 'OutputKey' in output and 'OutputValue' in output:
-                        outputs[output['OutputKey']] = output['OutputValue']
+            if stack and "Outputs" in stack:
+                for output in stack["Outputs"]:
+                    if "OutputKey" in output and "OutputValue" in output:
+                        outputs[output["OutputKey"]] = output["OutputValue"]
 
             log_with_request_id(
                 ctx,
                 LogLevel.INFO,
-                f'Described CloudFormation stack {stack_name} for EKS cluster {cluster_name}',
+                f"Described CloudFormation stack {stack_name} for EKS cluster {cluster_name}",
             )
 
             # Safely extract stack details
-            stack_id = ''
-            creation_time = ''
-            stack_status = ''
+            stack_id = ""
+            creation_time = ""
+            stack_status = ""
 
             if stack:
-                stack_id = stack.get('StackId', '')
+                stack_id = stack.get("StackId", "")
 
                 # Safely handle creation time
-                if 'CreationTime' in stack:
-                    creation_time_obj = stack['CreationTime']
-                    if hasattr(creation_time_obj, 'isoformat'):
+                if "CreationTime" in stack:
+                    creation_time_obj = stack["CreationTime"]
+                    if hasattr(creation_time_obj, "isoformat"):
                         creation_time = creation_time_obj.isoformat()
                     else:
                         creation_time = str(creation_time_obj)
 
-                stack_status = stack.get('StackStatus', '')
+                stack_status = stack.get("StackStatus", "")
 
             data = ManageEksStacksData(
                 operation=DESCRIBE_OPERATION,
@@ -506,30 +564,32 @@ class EksStackHandler:
                 creation_time=creation_time,
                 stack_status=stack_status,
                 outputs=outputs,
-                template_path='',
-                stack_arn='',
+                template_path="",
+                stack_arn="",
             )
 
             return CallToolResult(
                 isError=False,
                 content=[
                     TextContent(
-                        type='text',
-                        text=f'Successfully described CloudFormation stack {stack_name} for EKS cluster {cluster_name}',
+                        type="text",
+                        text=f"Successfully described CloudFormation stack {stack_name} for EKS cluster {cluster_name}",
                     ),
                     TextContent(
-                        type='text',
+                        type="text",
                         text=json.dumps(data.model_dump()),
                     ),
                 ],
             )
         except Exception as e:
-            error_message = f'Failed to describe stack: {str(e)}'
+            error_message = f"Failed to describe stack: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
 
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message or 'Unknown error')],
+                content=[
+                    TextContent(type="text", text=error_message or "Unknown error")
+                ],
             )
 
     def _remove_checkov_metadata(self, resource: Dict[str, Any]) -> None:
@@ -538,41 +598,45 @@ class EksStackHandler:
         Args:
             resource: The resource dictionary to process
         """
-        if 'Metadata' in resource:
+        if "Metadata" in resource:
             # Check if there's checkov metadata
-            if 'checkov' in resource['Metadata']:
+            if "checkov" in resource["Metadata"]:
                 # Remove only the checkov metadata
-                del resource['Metadata']['checkov']
+                del resource["Metadata"]["checkov"]
 
                 # If Metadata is now empty, remove it entirely
-                if not resource['Metadata']:
-                    del resource['Metadata']
+                if not resource["Metadata"]:
+                    del resource["Metadata"]
 
     async def _delete_stack(
         self, ctx: Context, stack_name: str, cluster_name: str
     ) -> CallToolResult:
         """Delete a CloudFormation stack."""
         try:
-            # Create CloudFormation client
-            cfn_client = AwsHelper.create_boto3_client('cloudformation')
+            # Get CloudFormation client with appropriate credentials
+            cfn_client = self._get_cfn_client(cluster_name)
 
             # Verify stack ownership
-            success, stack, error_message = self._ensure_stack_ownership(ctx, stack_name, 'delete')
+            success, stack, error_message = self._ensure_stack_ownership(
+                ctx, stack_name, "delete", cluster_name
+            )
             if not success:
                 # Prepare error response with available stack details
-                stack_id = ''
+                stack_id = ""
                 if stack:
-                    stack_id = stack['StackId']
+                    stack_id = stack["StackId"]
 
                 return CallToolResult(
                     isError=True,
-                    content=[TextContent(type='text', text=error_message or 'Unknown error')],
+                    content=[
+                        TextContent(type="text", text=error_message or "Unknown error")
+                    ],
                 )
 
             # Safely extract stack ID
-            stack_id = ''
-            if stack and 'StackId' in stack:
-                stack_id = stack['StackId']
+            stack_id = ""
+            if stack and "StackId" in stack:
+                stack_id = stack["StackId"]
 
             # Delete the stack
             cfn_client.delete_stack(StackName=stack_name)
@@ -580,7 +644,7 @@ class EksStackHandler:
             log_with_request_id(
                 ctx,
                 LogLevel.INFO,
-                f'Initiated deletion of CloudFormation stack {stack_name} for EKS cluster {cluster_name}',
+                f"Initiated deletion of CloudFormation stack {stack_name} for EKS cluster {cluster_name}",
             )
 
             data = ManageEksStacksData(
@@ -588,30 +652,32 @@ class EksStackHandler:
                 stack_name=stack_name,
                 stack_id=stack_id,
                 cluster_name=cluster_name,
-                template_path='',
-                stack_arn='',
-                creation_time='',
-                stack_status='',
+                template_path="",
+                stack_arn="",
+                creation_time="",
+                stack_status="",
             )
 
             return CallToolResult(
                 isError=False,
                 content=[
                     TextContent(
-                        type='text',
-                        text=f'Initiated deletion of CloudFormation stack {stack_name} for EKS cluster {cluster_name}. Deletion is in progress.',
+                        type="text",
+                        text=f"Initiated deletion of CloudFormation stack {stack_name} for EKS cluster {cluster_name}. Deletion is in progress.",
                     ),
                     TextContent(
-                        type='text',
+                        type="text",
                         text=json.dumps(data.model_dump()),
                     ),
                 ],
             )
         except Exception as e:
-            error_message = f'Failed to delete stack: {str(e)}'
+            error_message = f"Failed to delete stack: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
 
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message or 'Unknown error')],
+                content=[
+                    TextContent(type="text", text=error_message or "Unknown error")
+                ],
             )

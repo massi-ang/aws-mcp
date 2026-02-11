@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CloudWatch handler for the EKS MCP Server."""
+"""CloudWatch handler for the EKS MCP Server.
+
+This module provides tools for retrieving and analyzing CloudWatch logs and metrics
+from EKS clusters, with support for multi-region and multi-account operations.
+"""
 
 import datetime
 import json
 import time
 from awslabs.eks_mcp_server.aws_helper import AwsHelper
+from awslabs.eks_mcp_server.config import ConfigManager
 from awslabs.eks_mcp_server.logging_helper import LogLevel, log_with_request_id
 from awslabs.eks_mcp_server.models import CloudWatchLogsData, CloudWatchMetricsData
 from mcp.server.fastmcp import Context
@@ -44,8 +49,44 @@ class CloudWatchHandler:
         self.allow_sensitive_data_access = allow_sensitive_data_access
 
         # Register tools
-        self.mcp.tool(name='get_cloudwatch_logs')(self.get_cloudwatch_logs)
-        self.mcp.tool(name='get_cloudwatch_metrics')(self.get_cloudwatch_metrics)
+        self.mcp.tool(name="get_cloudwatch_logs")(self.get_cloudwatch_logs)
+        self.mcp.tool(name="get_cloudwatch_metrics")(self.get_cloudwatch_metrics)
+
+    def _get_logs_client(self, cluster_name: str):
+        """Get a CloudWatch Logs client with appropriate credentials.
+
+        If a cluster configuration is available for the given cluster name,
+        uses the configured credentials. Otherwise falls back to default.
+
+        Args:
+            cluster_name: Cluster name to look up configuration
+
+        Returns:
+            CloudWatch Logs boto3 client
+        """
+        cluster_config = ConfigManager.get_cluster(cluster_name)
+        if cluster_config:
+            return AwsHelper.create_boto3_client_for_cluster(cluster_config, "logs")
+        return AwsHelper.create_boto3_client("logs")
+
+    def _get_cloudwatch_client(self, cluster_name: str):
+        """Get a CloudWatch client with appropriate credentials.
+
+        If a cluster configuration is available for the given cluster name,
+        uses the configured credentials. Otherwise falls back to default.
+
+        Args:
+            cluster_name: Cluster name to look up configuration
+
+        Returns:
+            CloudWatch boto3 client
+        """
+        cluster_config = ConfigManager.get_cluster(cluster_name)
+        if cluster_config:
+            return AwsHelper.create_boto3_client_for_cluster(
+                cluster_config, "cloudwatch"
+            )
+        return AwsHelper.create_boto3_client("cloudwatch")
 
     def resolve_time_range(
         self,
@@ -92,7 +133,7 @@ class CloudWatchHandler:
         ),
         cluster_name: str = Field(
             ...,
-            description='Name of the EKS cluster where the resource is located. Used to construct the CloudWatch log group name.',
+            description="Name of the EKS cluster where the resource is located. Used to construct the CloudWatch log group name.",
         ),
         log_type: str = Field(
             ...,
@@ -105,11 +146,11 @@ class CloudWatchHandler:
         ),
         resource_name: Optional[str] = Field(
             None,
-            description='Resource name to search for in log messages (e.g., pod name, node name, container name). Used to filter logs for the specific resource.',
+            description="Resource name to search for in log messages (e.g., pod name, node name, container name). Used to filter logs for the specific resource.",
         ),
         minutes: int = Field(
             15,
-            description='Number of minutes to look back for logs. Default: 15. Ignored if start_time is provided. Use smaller values for recent issues, larger values for historical analysis.',
+            description="Number of minutes to look back for logs. Default: 15. Ignored if start_time is provided. Use smaller values for recent issues, larger values for historical analysis.",
         ),
         start_time: Optional[str] = Field(
             None,
@@ -121,7 +162,7 @@ class CloudWatchHandler:
         ),
         limit: int = Field(
             50,
-            description='Maximum number of log entries to return. Use lower values (10-50) for faster queries, higher values (100-1000) for more comprehensive results. IMPORTANT: Higher values may impact performance.',
+            description="Maximum number of log entries to return. Use lower values (10-50) for faster queries, higher values (100-1000) for more comprehensive results. IMPORTANT: Higher values may impact performance.",
         ),
         filter_pattern: Optional[str] = Field(
             None,
@@ -177,31 +218,29 @@ class CloudWatchHandler:
         try:
             # Check if sensitive data access is allowed
             if not self.allow_sensitive_data_access:
-                error_message = (
-                    'Access to CloudWatch logs requires --allow-sensitive-data-access flag'
-                )
+                error_message = "Access to CloudWatch logs requires --allow-sensitive-data-access flag"
                 log_with_request_id(ctx, LogLevel.ERROR, error_message)
                 return CallToolResult(
                     isError=True,
-                    content=[TextContent(type='text', text=error_message)],
+                    content=[TextContent(type="text", text=error_message)],
                 )
 
             start_dt, end_dt = self.resolve_time_range(start_time, end_time, minutes)
 
-            # Create CloudWatch Logs client
-            logs = AwsHelper.create_boto3_client('logs')
+            # Create CloudWatch Logs client with appropriate credentials
+            logs = self._get_logs_client(cluster_name)
 
             # Determine the log group based on log_type
-            known_types = {'application', 'host', 'performance', 'dataplane'}
+            known_types = {"application", "host", "performance", "dataplane"}
             if log_type in known_types:
-                log_group = f'/aws/containerinsights/{cluster_name}/{log_type}'
-            elif log_type == 'control-plane':
-                log_group = f'/aws/eks/{cluster_name}/cluster'
+                log_group = f"/aws/containerinsights/{cluster_name}/{log_type}"
+            elif log_type == "control-plane":
+                log_group = f"/aws/eks/{cluster_name}/cluster"
             else:
                 log_group = log_type  # Assume user passed full log group name
 
             # Determine fields to include
-            query_fields = fields if fields else '@timestamp, @message'
+            query_fields = fields if fields else "@timestamp, @message"
 
             # Construct the base query
             query = f"""
@@ -209,23 +248,25 @@ class CloudWatchHandler:
             """
 
             # This prevents filtering by cluster name twice when the resource type is "cluster"
-            if resource_type != 'cluster' and resource_name is not None:
+            if resource_type != "cluster" and resource_name is not None:
                 query += f"\n| filter @message like '{resource_name}'"
 
             # Add additional filter pattern if provided
             if filter_pattern:
-                query += f'\n| {filter_pattern}'
+                query += f"\n| {filter_pattern}"
 
             # Add sorting and limit
-            query += f'\n| sort @timestamp desc\n| limit {limit}'
+            query += f"\n| sort @timestamp desc\n| limit {limit}"
 
             resource_str = (
-                f'{resource_type} {resource_name} in ' if resource_name is not None else ''
+                f"{resource_type} {resource_name} in "
+                if resource_name is not None
+                else ""
             )
             log_with_request_id(
                 ctx,
                 LogLevel.INFO,
-                f'Starting CloudWatch Logs query for {resource_str}cluster {cluster_name}',
+                f"Starting CloudWatch Logs query for {resource_str}cluster {cluster_name}",
                 log_group=log_group,
                 start_time=start_dt.isoformat(),
                 end_time=end_dt.isoformat(),
@@ -239,7 +280,7 @@ class CloudWatchHandler:
                 queryString=query,
             )
 
-            query_id = start_query_response['queryId']
+            query_id = start_query_response["queryId"]
 
             # Poll for results
             query_response = self._poll_query_results(
@@ -247,7 +288,7 @@ class CloudWatchHandler:
             )
 
             # Process results
-            results = query_response['results']
+            results = query_response["results"]
             log_entries = []
 
             for result in results:
@@ -257,7 +298,7 @@ class CloudWatchHandler:
             log_with_request_id(
                 ctx,
                 LogLevel.INFO,
-                f'Retrieved {len(log_entries)} log entries for {resource_str}cluster {cluster_name}',
+                f"Retrieved {len(log_entries)} log entries for {resource_str}cluster {cluster_name}",
             )
 
             # Create structured data model
@@ -277,24 +318,26 @@ class CloudWatchHandler:
                 isError=False,
                 content=[
                     TextContent(
-                        type='text',
-                        text=f'Successfully retrieved {len(log_entries)} log entries for {resource_str}cluster {cluster_name}',
+                        type="text",
+                        text=f"Successfully retrieved {len(log_entries)} log entries for {resource_str}cluster {cluster_name}",
                     ),
                     TextContent(
-                        type='text',
+                        type="text",
                         text=json.dumps(data.model_dump()),
                     ),
                 ],
             )
 
         except Exception as e:
-            resource_name_str = f' {resource_name}' if resource_name is not None else ''
-            error_message = f'Failed to get logs for {resource_type}{resource_name_str}: {str(e)}'
+            resource_name_str = f" {resource_name}" if resource_name is not None else ""
+            error_message = (
+                f"Failed to get logs for {resource_type}{resource_name_str}: {str(e)}"
+            )
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
 
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message)],
+                content=[TextContent(type="text", text=error_message)],
             )
 
     async def get_cloudwatch_metrics(
@@ -302,7 +345,7 @@ class CloudWatchHandler:
         ctx: Context,
         cluster_name: str = Field(
             ...,
-            description='Name of the EKS cluster to get metrics for.',
+            description="Name of the EKS cluster to get metrics for.",
         ),
         metric_name: str = Field(
             ...,
@@ -321,11 +364,11 @@ class CloudWatchHandler:
         ),
         dimensions: dict = Field(
             ...,
-            description='Dimensions to use for the CloudWatch metric query. Must include appropriate dimensions for the resource type and metric (e.g., ClusterName, PodName, Namespace).',
+            description="Dimensions to use for the CloudWatch metric query. Must include appropriate dimensions for the resource type and metric (e.g., ClusterName, PodName, Namespace).",
         ),
         minutes: int = Field(
             15,
-            description='Number of minutes to look back for metrics. Default: 15. Ignored if start_time is provided. IMPORTANT: Choose a time range appropriate for the metric resolution.',
+            description="Number of minutes to look back for metrics. Default: 15. Ignored if start_time is provided. IMPORTANT: Choose a time range appropriate for the metric resolution.",
         ),
         start_time: Optional[str] = Field(
             None,
@@ -337,14 +380,14 @@ class CloudWatchHandler:
         ),
         limit: int = Field(
             50,
-            description='Maximum number of data points to return. Higher values (100-1000) provide more granular data but may impact performance. IMPORTANT: Balance between granularity and performance.',
+            description="Maximum number of data points to return. Higher values (100-1000) provide more granular data but may impact performance. IMPORTANT: Balance between granularity and performance.",
         ),
         period: int = Field(
             60,
-            description='Period in seconds for the metric data points. Default: 60 (1 minute). Lower values (1-60) provide higher resolution but may be less available. IMPORTANT: Match to your monitoring needs.',
+            description="Period in seconds for the metric data points. Default: 60 (1 minute). Lower values (1-60) provide higher resolution but may be less available. IMPORTANT: Match to your monitoring needs.",
         ),
         stat: str = Field(
-            'Average',
+            "Average",
             description="""Statistic to use for the metric aggregation:
             - Average: Mean value during the period
             - Sum: Total value during the period
@@ -404,22 +447,25 @@ class CloudWatchHandler:
         try:
             start_dt, end_dt = self.resolve_time_range(start_time, end_time, minutes)
 
-            # Create CloudWatch client
-            cloudwatch = AwsHelper.create_boto3_client('cloudwatch')
+            # Create CloudWatch client with appropriate credentials
+            cloudwatch = self._get_cloudwatch_client(cluster_name)
 
             # Validate that cluster_name matches ClusterName in dimensions if present
-            if 'ClusterName' in dimensions and dimensions['ClusterName'] != cluster_name:
+            if (
+                "ClusterName" in dimensions
+                and dimensions["ClusterName"] != cluster_name
+            ):
                 error_message = f"Provided cluster_name '{cluster_name}' does not match ClusterName dimension '{dimensions['ClusterName']}'"
                 log_with_request_id(ctx, LogLevel.ERROR, error_message)
                 return CallToolResult(
                     isError=True,
-                    content=[TextContent(type='text', text=error_message)],
+                    content=[TextContent(type="text", text=error_message)],
                 )
 
             log_with_request_id(
                 ctx,
                 LogLevel.INFO,
-                f'Getting CloudWatch metrics for {metric_name} in cluster {cluster_name}',
+                f"Getting CloudWatch metrics for {metric_name} in cluster {cluster_name}",
                 metric_name=metric_name,
                 namespace=namespace,
                 dimensions=str(dimensions),
@@ -429,18 +475,18 @@ class CloudWatchHandler:
 
             # Create the metric data query
             metric_data_query = {
-                'Id': 'm1',
-                'ReturnData': True,
+                "Id": "m1",
+                "ReturnData": True,
             }
 
             # Convert dimensions to the format expected by CloudWatch
-            dimension_list = [{'Name': k, 'Value': v} for k, v in dimensions.items()]
+            dimension_list = [{"Name": k, "Value": v} for k, v in dimensions.items()]
 
             # Create the metric definition
             metric_def = {
-                'Namespace': namespace,
-                'MetricName': metric_name,
-                'Dimensions': dimension_list,
+                "Namespace": namespace,
+                "MetricName": metric_name,
+                "Dimensions": dimension_list,
             }
 
             # Create the metric stat with the appropriate statistics
@@ -449,10 +495,14 @@ class CloudWatchHandler:
             stat_value = stat if isinstance(stat, str) else stat.default
 
             # Create the metric stat
-            metric_stat = {'Metric': metric_def, 'Period': period_value, 'Stat': stat_value}
+            metric_stat = {
+                "Metric": metric_def,
+                "Period": period_value,
+                "Stat": stat_value,
+            }
 
             # Add the metric stat to the query
-            metric_data_query['MetricStat'] = metric_stat
+            metric_data_query["MetricStat"] = metric_stat
 
             # Get metric data
             response = cloudwatch.get_metric_data(
@@ -463,20 +513,20 @@ class CloudWatchHandler:
             )
 
             # Process results
-            metric_data = response['MetricDataResults'][0]
-            timestamps = [ts.isoformat() for ts in metric_data.get('Timestamps', [])]
-            values = metric_data.get('Values', [])
+            metric_data = response["MetricDataResults"][0]
+            timestamps = [ts.isoformat() for ts in metric_data.get("Timestamps", [])]
+            values = metric_data.get("Values", [])
 
             # Create data points
             data_points = []
             for i in range(len(timestamps)):
                 if i < len(values):
-                    data_points.append({'timestamp': timestamps[i], 'value': values[i]})
+                    data_points.append({"timestamp": timestamps[i], "value": values[i]})
 
             log_with_request_id(
                 ctx,
                 LogLevel.INFO,
-                f'Retrieved {len(data_points)} metric data points for {metric_name}',
+                f"Retrieved {len(data_points)} metric data points for {metric_name}",
             )
 
             # Create structured data model
@@ -494,23 +544,23 @@ class CloudWatchHandler:
                 isError=False,
                 content=[
                     TextContent(
-                        type='text',
-                        text=f'Successfully retrieved {len(data_points)} metric data points for {metric_name} in cluster {cluster_name}',
+                        type="text",
+                        text=f"Successfully retrieved {len(data_points)} metric data points for {metric_name} in cluster {cluster_name}",
                     ),
                     TextContent(
-                        type='text',
+                        type="text",
                         text=json.dumps(data.model_dump()),
                     ),
                 ],
             )
 
         except Exception as e:
-            error_message = f'Failed to get metrics: {str(e)}'
+            error_message = f"Failed to get metrics: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
 
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message)],
+                content=[TextContent(type="text", text=error_message)],
             )
 
     def _poll_query_results(
@@ -546,32 +596,28 @@ class CloudWatchHandler:
         log_with_request_id(
             ctx,
             LogLevel.INFO,
-            f'Polling for CloudWatch Logs query results (query_id: {query_id})',
+            f"Polling for CloudWatch Logs query results (query_id: {query_id})",
         )
 
-        resource_name_str = f' {resource_name}' if resource_name is not None else ''
+        resource_name_str = f" {resource_name}" if resource_name is not None else ""
 
         while attempts < max_attempts:
             query_response = logs_client.get_query_results(queryId=query_id)
-            status = query_response.get('status')
+            status = query_response.get("status")
 
-            if status == 'Complete':
+            if status == "Complete":
                 log_with_request_id(
                     ctx,
                     LogLevel.INFO,
-                    f'CloudWatch Logs query completed successfully after {attempts + 1} attempts',
+                    f"CloudWatch Logs query completed successfully after {attempts + 1} attempts",
                 )
                 return query_response
-            elif status == 'Failed':
-                error_message = (
-                    f'CloudWatch Logs query failed for {resource_type}{resource_name_str}'
-                )
+            elif status == "Failed":
+                error_message = f"CloudWatch Logs query failed for {resource_type}{resource_name_str}"
                 log_with_request_id(ctx, LogLevel.ERROR, error_message)
                 raise Exception(error_message)
-            elif status == 'Cancelled':
-                error_message = (
-                    f'CloudWatch Logs query was cancelled for {resource_type}{resource_name_str}'
-                )
+            elif status == "Cancelled":
+                error_message = f"CloudWatch Logs query was cancelled for {resource_type}{resource_name_str}"
                 log_with_request_id(ctx, LogLevel.ERROR, error_message)
                 raise Exception(error_message)
 
@@ -580,7 +626,7 @@ class CloudWatchHandler:
                 log_with_request_id(
                     ctx,
                     LogLevel.INFO,
-                    f'Waiting for CloudWatch Logs query to complete (attempt {attempts + 1}/{max_attempts})',
+                    f"Waiting for CloudWatch Logs query to complete (attempt {attempts + 1}/{max_attempts})",
                 )
 
             # Sleep with exponential backoff (capped at 5 seconds)
@@ -589,7 +635,7 @@ class CloudWatchHandler:
             attempts += 1
 
         # If we've exhausted all attempts, raise a timeout error
-        error_message = f'CloudWatch Logs query timed out after {max_attempts} attempts for {resource_type}{resource_name_str}'
+        error_message = f"CloudWatch Logs query timed out after {max_attempts} attempts for {resource_type}{resource_name_str}"
         log_with_request_id(ctx, LogLevel.ERROR, error_message)
         raise TimeoutError(error_message)
 
@@ -604,32 +650,32 @@ class CloudWatchHandler:
         """
         entry = {}
         for field in result:
-            if field['field'] == '@timestamp':
-                entry['timestamp'] = field['value']
-            elif field['field'] == '@message':
-                message = field['value']
+            if field["field"] == "@timestamp":
+                entry["timestamp"] = field["value"]
+            elif field["field"] == "@message":
+                message = field["value"]
 
                 # Clean up the message to make it more human-readable
-                message = message.replace('\n', '')
+                message = message.replace("\n", "")
                 message = message.replace('"', '"')
 
                 # Try to parse JSON if the message appears to be JSON
-                if message.startswith('{') and message.endswith('}'):
+                if message.startswith("{") and message.endswith("}"):
                     try:
                         parsed_json = json.loads(message)
 
                         # Format any nested JSON structures
                         parsed_json = self._format_nested_json(parsed_json)
 
-                        entry['message'] = parsed_json
+                        entry["message"] = parsed_json
                     except json.JSONDecodeError:
                         # If it's not valid JSON, just use the cleaned message
-                        entry['message'] = message
+                        entry["message"] = message
                 else:
                     # For non-JSON messages, use the cleaned message
-                    entry['message'] = message
+                    entry["message"] = message
             else:
-                entry[field['field']] = field['value']
+                entry[field["field"]] = field["value"]
         return entry
 
     def _format_nested_json(self, obj):
@@ -645,7 +691,11 @@ class CloudWatchHandler:
             for key, value in obj.items():
                 if isinstance(value, (dict, list)):
                     obj[key] = self._format_nested_json(value)
-                elif isinstance(value, str) and value.startswith('{') and value.endswith('}'):
+                elif (
+                    isinstance(value, str)
+                    and value.startswith("{")
+                    and value.endswith("}")
+                ):
                     try:
                         obj[key] = json.loads(value)
                     except json.JSONDecodeError:

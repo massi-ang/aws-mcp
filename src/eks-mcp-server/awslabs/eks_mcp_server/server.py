@@ -18,14 +18,20 @@ This module implements the EKS MCP Server, which provides tools for managing Ama
 and Kubernetes resources through the Model Context Protocol (MCP).
 
 Environment Variables:
-    AWS_REGION: AWS region to use for AWS API calls
-    AWS_PROFILE: AWS profile to use for credentials
+    AWS_REGION: AWS region to use for AWS API calls (default region when not using cluster config)
+    AWS_PROFILE: AWS profile to use for credentials (default profile when not using cluster config)
+    EKS_CLUSTER_CONFIG: Path to JSON file containing cluster configuration for multi-region/account support
     FASTMCP_LOG_LEVEL: Log level (default: WARNING)
 """
 
 import argparse
+import os
 from awslabs.eks_mcp_server.cloudwatch_handler import CloudWatchHandler
-from awslabs.eks_mcp_server.cloudwatch_metrics_guidance_handler import CloudWatchMetricsHandler
+from awslabs.eks_mcp_server.cloudwatch_metrics_guidance_handler import (
+    CloudWatchMetricsHandler,
+)
+from awslabs.eks_mcp_server.config import ConfigManager
+from awslabs.eks_mcp_server.eks_discovery_handler import EKSDiscoveryHandler
 from awslabs.eks_mcp_server.eks_kb_handler import EKSKnowledgeBaseHandler
 from awslabs.eks_mcp_server.eks_stack_handler import EksStackHandler
 from awslabs.eks_mcp_server.iam_handler import IAMHandler
@@ -83,14 +89,14 @@ DO NOT use standard EKS and Kubernetes CLI commands (aws eks, eksctl, kubectl). 
 """
 
 SERVER_DEPENDENCIES = [
-    'pydantic',
-    'loguru',
-    'boto3',
-    'kubernetes',
-    'requests',
-    'pyyaml',
-    'cachetools',
-    'requests_auth_aws_sigv4',
+    "pydantic",
+    "loguru",
+    "boto3",
+    "kubernetes",
+    "requests",
+    "pyyaml",
+    "cachetools",
+    "requests_auth_aws_sigv4",
 ]
 
 # Global reference to the MCP server instance for testing purposes
@@ -100,7 +106,7 @@ mcp = None
 def create_server():
     """Create and configure the MCP server instance."""
     return FastMCP(
-        'awslabs.eks-mcp-server',
+        "awslabs.eks-mcp-server",
         instructions=SERVER_INSTRUCTIONS,
         dependencies=SERVER_DEPENDENCIES,
     )
@@ -111,35 +117,54 @@ def main():
     global mcp
 
     parser = argparse.ArgumentParser(
-        description='An AWS Labs Model Context Protocol (MCP) server for EKS'
+        description="An AWS Labs Model Context Protocol (MCP) server for EKS"
     )
     parser.add_argument(
-        '--allow-write',
+        "--allow-write",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help='Enable write access mode (allow mutating operations)',
+        help="Enable write access mode (allow mutating operations)",
     )
     parser.add_argument(
-        '--allow-sensitive-data-access',
+        "--allow-sensitive-data-access",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help='Enable sensitive data access (required for reading logs, events, and Kubernetes Secrets)',
+        help="Enable sensitive data access (required for reading logs, events, and Kubernetes Secrets)",
+    )
+    parser.add_argument(
+        "--cluster-config",
+        type=str,
+        default=os.environ.get("EKS_CLUSTER_CONFIG"),
+        help="Path to JSON file containing cluster configuration for multi-region/account support",
     )
 
     args = parser.parse_args()
 
     allow_write = args.allow_write
     allow_sensitive_data_access = args.allow_sensitive_data_access
+    cluster_config_path = args.cluster_config
+
+    # Load cluster configuration if provided
+    if cluster_config_path:
+        try:
+            ConfigManager.load_config(cluster_config_path)
+            logger.info(f"Loaded cluster configuration from {cluster_config_path}")
+        except FileNotFoundError as e:
+            logger.error(f"Cluster configuration file not found: {e}")
+            raise SystemExit(1)
+        except Exception as e:
+            logger.error(f"Failed to load cluster configuration: {e}")
+            raise SystemExit(1)
 
     # Log startup mode
     mode_info = []
     if not allow_write:
-        mode_info.append('read-only mode')
+        mode_info.append("read-only mode")
     if not allow_sensitive_data_access:
-        mode_info.append('restricted sensitive data access mode')
+        mode_info.append("restricted sensitive data access mode")
 
-    mode_str = ' in ' + ', '.join(mode_info) if mode_info else ''
-    logger.info(f'Starting EKS MCP Server{mode_str}')
+    mode_str = " in " + ", ".join(mode_info) if mode_info else ""
+    logger.info(f"Starting EKS MCP Server{mode_str}")
 
     # Create the MCP server instance
     mcp = create_server()
@@ -153,6 +178,7 @@ def main():
     CloudWatchMetricsHandler(mcp)
     VpcConfigHandler(mcp, allow_sensitive_data_access)
     InsightsHandler(mcp, allow_sensitive_data_access)
+    EKSDiscoveryHandler(mcp)
 
     # Run server
     mcp.run()
@@ -160,5 +186,5 @@ def main():
     return mcp
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

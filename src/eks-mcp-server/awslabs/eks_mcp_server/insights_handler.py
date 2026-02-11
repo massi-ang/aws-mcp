@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Insights handler for the EKS MCP Server."""
+"""Insights handler for the EKS MCP Server.
+
+This module provides tools for retrieving and analyzing EKS cluster insights,
+with support for multi-region and multi-account operations.
+"""
 
 import json
 from awslabs.eks_mcp_server.aws_helper import AwsHelper
+from awslabs.eks_mcp_server.config import ConfigManager
 from awslabs.eks_mcp_server.logging_helper import LogLevel, log_with_request_id
 from awslabs.eks_mcp_server.models import (
     EksInsightItem,
@@ -51,19 +56,30 @@ class InsightsHandler:
         self.allow_sensitive_data_access = allow_sensitive_data_access
 
         # Register tools
-        self.mcp.tool(name='get_eks_insights')(self.get_eks_insights)
+        self.mcp.tool(name="get_eks_insights")(self.get_eks_insights)
 
-        # Initialize AWS clients
-        self.eks_client = AwsHelper.create_boto3_client('eks')
+    def _get_eks_client(self, cluster_name: str):
+        """Get an EKS client with appropriate credentials.
+
+        Args:
+            cluster_name: Cluster name to look up configuration
+
+        Returns:
+            EKS boto3 client
+        """
+        cluster_config = ConfigManager.get_cluster(cluster_name)
+        if cluster_config:
+            return AwsHelper.create_boto3_client_for_cluster(cluster_config, "eks")
+        return AwsHelper.create_boto3_client("eks")
 
     # EKS Insights tool
     async def get_eks_insights(
         self,
         ctx: Context,
-        cluster_name: str = Field(..., description='Name of the EKS cluster'),
+        cluster_name: str = Field(..., description="Name of the EKS cluster"),
         insight_id: Optional[str] = Field(
             None,
-            description='ID of a specific insight to get detailed information for. If provided, returns detailed information about this specific insight.',
+            description="ID of a specific insight to get detailed information for. If provided, returns detailed information about this specific insight.",
         ),
         category: Optional[str] = Field(
             None,
@@ -71,7 +87,7 @@ class InsightsHandler:
         ),
         next_token: Optional[str] = Field(
             None,
-            description='Token for pagination to get the next set of results',
+            description="Token for pagination to get the next set of results",
         ),
     ) -> CallToolResult:
         """Get EKS Insights for cluster configuration and upgrade readiness.
@@ -132,8 +148,8 @@ class InsightsHandler:
     ) -> CallToolResult:
         """Internal implementation of get_eks_insights."""
         try:
-            # Always use the default EKS client
-            eks_client = self.eks_client
+            # Get EKS client with appropriate credentials
+            eks_client = self._get_eks_client(cluster_name)
 
             # Determine operation mode based on whether insight_id is provided
             detail_mode = insight_id is not None
@@ -150,11 +166,11 @@ class InsightsHandler:
                 )
 
         except Exception as e:
-            error_message = f'Error processing EKS insights request: {str(e)}'
+            error_message = f"Error processing EKS insights request: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message)],
+                content=[TextContent(type="text", text=error_message)],
             )
 
     async def _get_insight_detail(
@@ -169,48 +185,56 @@ class InsightsHandler:
         log_with_request_id(
             ctx,
             LogLevel.INFO,
-            f'Getting details for insight {insight_id} in cluster {cluster_name}',
+            f"Getting details for insight {insight_id} in cluster {cluster_name}",
         )
 
         try:
-            response = eks_client.describe_insight(id=insight_id, clusterName=cluster_name)
+            response = eks_client.describe_insight(
+                id=insight_id, clusterName=cluster_name
+            )
 
             # Extract and format the insight details
-            if 'insight' in response:
-                insight_data = response['insight']
+            if "insight" in response:
+                insight_data = response["insight"]
 
                 # Create insight status object
                 status_obj = EksInsightStatus(
-                    status=insight_data.get('insightStatus', {}).get('status', 'UNKNOWN'),
-                    reason=insight_data.get('insightStatus', {}).get('reason', ''),
+                    status=insight_data.get("insightStatus", {}).get(
+                        "status", "UNKNOWN"
+                    ),
+                    reason=insight_data.get("insightStatus", {}).get("reason", ""),
                 )
 
                 # Handle datetime objects for timestamps
-                last_refresh_time = insight_data.get('lastRefreshTime', 0)
+                last_refresh_time = insight_data.get("lastRefreshTime", 0)
                 if isinstance(last_refresh_time, datetime):
                     last_refresh_time = last_refresh_time.timestamp()
 
-                last_transition_time = insight_data.get('lastTransitionTime', 0)
+                last_transition_time = insight_data.get("lastTransitionTime", 0)
                 if isinstance(last_transition_time, datetime):
                     last_transition_time = last_transition_time.timestamp()
 
                 # Convert insight to EksInsightItem format
                 insight_item = EksInsightItem(
-                    id=insight_data.get('id', ''),
-                    name=insight_data.get('name', ''),
-                    category=insight_data.get('category', ''),
-                    kubernetes_version=insight_data.get('kubernetesVersion'),
+                    id=insight_data.get("id", ""),
+                    name=insight_data.get("name", ""),
+                    category=insight_data.get("category", ""),
+                    kubernetes_version=insight_data.get("kubernetesVersion"),
                     last_refresh_time=last_refresh_time,
                     last_transition_time=last_transition_time,
-                    description=insight_data.get('description', ''),
+                    description=insight_data.get("description", ""),
                     insight_status=status_obj,
-                    recommendation=insight_data.get('recommendation'),
-                    additional_info=insight_data.get('additionalInfo', {}),
-                    resources=insight_data.get('resources', []),
-                    category_specific_summary=insight_data.get('categorySpecificSummary', {}),
+                    recommendation=insight_data.get("recommendation"),
+                    additional_info=insight_data.get("additionalInfo", {}),
+                    resources=insight_data.get("resources", []),
+                    category_specific_summary=insight_data.get(
+                        "categorySpecificSummary", {}
+                    ),
                 )
 
-                success_message = f'Successfully retrieved details for insight {insight_id}'
+                success_message = (
+                    f"Successfully retrieved details for insight {insight_id}"
+                )
                 data = EksInsightsData(
                     cluster_name=cluster_name,
                     insights=[insight_item],
@@ -221,24 +245,24 @@ class InsightsHandler:
                 return CallToolResult(
                     isError=False,
                     content=[
-                        TextContent(type='text', text=success_message),
-                        TextContent(type='text', text=json.dumps(data.model_dump())),
+                        TextContent(type="text", text=success_message),
+                        TextContent(type="text", text=json.dumps(data.model_dump())),
                     ],
                 )
             else:
-                error_message = f'No insight details found for ID {insight_id}'
+                error_message = f"No insight details found for ID {insight_id}"
                 log_with_request_id(ctx, LogLevel.WARNING, error_message)
                 return CallToolResult(
                     isError=True,
-                    content=[TextContent(type='text', text=error_message)],
+                    content=[TextContent(type="text", text=error_message)],
                 )
 
         except Exception as e:
-            error_message = f'Error retrieving insight details: {str(e)}'
+            error_message = f"Error retrieving insight details: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message)],
+                content=[TextContent(type="text", text=error_message)],
             )
 
     async def _list_insights(
@@ -250,58 +274,64 @@ class InsightsHandler:
         next_token: Optional[str] = None,
     ) -> CallToolResult:
         """List EKS insights for a cluster with optional category filtering."""
-        log_with_request_id(ctx, LogLevel.INFO, f'Listing insights for cluster {cluster_name}')
+        log_with_request_id(
+            ctx, LogLevel.INFO, f"Listing insights for cluster {cluster_name}"
+        )
 
         try:
             # Build the list_insights parameters
-            list_params: dict[str, Any] = {'clusterName': cluster_name}
+            list_params: dict[str, Any] = {"clusterName": cluster_name}
 
             # Add category filter if provided
             if category:
                 log_with_request_id(
-                    ctx, LogLevel.INFO, f'Filtering insights by category: {category}'
+                    ctx, LogLevel.INFO, f"Filtering insights by category: {category}"
                 )
                 # Use the filter parameter with the correct structure
-                list_params['filter'] = {'categories': [category]}
+                list_params["filter"] = {"categories": [category]}
 
             # Add next_token if provided
             if next_token:
                 log_with_request_id(
-                    ctx, LogLevel.INFO, 'Using pagination token for next page of results'
+                    ctx,
+                    LogLevel.INFO,
+                    "Using pagination token for next page of results",
                 )
-                list_params['nextToken'] = next_token
+                list_params["nextToken"] = next_token
 
             response = eks_client.list_insights(**list_params)
 
             # Extract and format the insights
             insight_items = []
 
-            if 'insights' in response:
-                for insight_data in response['insights']:
+            if "insights" in response:
+                for insight_data in response["insights"]:
                     # Create insight status object
                     status_obj = EksInsightStatus(
-                        status=insight_data.get('insightStatus', {}).get('status', 'UNKNOWN'),
-                        reason=insight_data.get('insightStatus', {}).get('reason', ''),
+                        status=insight_data.get("insightStatus", {}).get(
+                            "status", "UNKNOWN"
+                        ),
+                        reason=insight_data.get("insightStatus", {}).get("reason", ""),
                     )
 
                     # Handle datetime objects for timestamps
-                    last_refresh_time = insight_data.get('lastRefreshTime', 0)
+                    last_refresh_time = insight_data.get("lastRefreshTime", 0)
                     if isinstance(last_refresh_time, datetime):
                         last_refresh_time = last_refresh_time.timestamp()
 
-                    last_transition_time = insight_data.get('lastTransitionTime', 0)
+                    last_transition_time = insight_data.get("lastTransitionTime", 0)
                     if isinstance(last_transition_time, datetime):
                         last_transition_time = last_transition_time.timestamp()
 
                     # Convert insight to EksInsightItem format
                     insight_item = EksInsightItem(
-                        id=insight_data.get('id', ''),
-                        name=insight_data.get('name', ''),
-                        category=insight_data.get('category', ''),
-                        kubernetes_version=insight_data.get('kubernetesVersion'),
+                        id=insight_data.get("id", ""),
+                        name=insight_data.get("name", ""),
+                        category=insight_data.get("category", ""),
+                        kubernetes_version=insight_data.get("kubernetesVersion"),
                         last_refresh_time=last_refresh_time,
                         last_transition_time=last_transition_time,
-                        description=insight_data.get('description', ''),
+                        description=insight_data.get("description", ""),
                         insight_status=status_obj,
                         # List mode doesn't include these fields
                         recommendation=None,
@@ -312,28 +342,26 @@ class InsightsHandler:
 
                     insight_items.append(insight_item)
 
-            success_message = (
-                f'Successfully retrieved {len(insight_items)} insights for cluster {cluster_name}'
-            )
+            success_message = f"Successfully retrieved {len(insight_items)} insights for cluster {cluster_name}"
             data = EksInsightsData(
                 cluster_name=cluster_name,
                 insights=insight_items,
-                next_token=response.get('nextToken'),
+                next_token=response.get("nextToken"),
                 detail_mode=False,
             )
 
             return CallToolResult(
                 isError=False,
                 content=[
-                    TextContent(type='text', text=success_message),
-                    TextContent(type='text', text=json.dumps(data.model_dump())),
+                    TextContent(type="text", text=success_message),
+                    TextContent(type="text", text=json.dumps(data.model_dump())),
                 ],
             )
 
         except Exception as e:
-            error_message = f'Error listing insights: {str(e)}'
+            error_message = f"Error listing insights: {str(e)}"
             log_with_request_id(ctx, LogLevel.ERROR, error_message)
             return CallToolResult(
                 isError=True,
-                content=[TextContent(type='text', text=error_message)],
+                content=[TextContent(type="text", text=error_message)],
             )
